@@ -10,22 +10,36 @@ import '../generated/protocol.dart';
 
 /// Full-featured, production-ready TUS (Resumable Upload Protocol v1.0.0) Server Route.
 ///
-/// Implements Core TUS specification and Extensions:
-/// - Core Protocol (HEAD, PATCH, OPTIONS)
-/// - Creation (`creation`)
-/// - Creation With Upload (`creation-with-upload`)
-/// - Creation Defer Length (`creation-defer-length`)
-/// - Expiration (`expiration`)
-/// - Checksum (`checksum`) - sha1, md5, sha256
-/// - Termination (`termination`)
-/// - Concatenation (`concatenation`)
+/// Inspired by official `@tus/server` architecture:
+/// - Core Protocol (`HEAD`, `PATCH`, `OPTIONS`)
+/// - Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
+/// - Max size limits (`Tus-Max-Size` enforcement returning 413)
+/// - Event Hooks (`onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`)
+/// - Metadata Base64 Parser (`parseMetadata`)
+/// - Expired uploads cleanup utility (`cleanExpiredUploads`)
 class TusUploadRoute extends Route {
-  static const String _tempDirPath = '/tmp/tus_uploads';
+  static const String _defaultTempDirPath = '/tmp/tus_uploads';
   static const String _tusVersion = '1.0.0';
   static const String _supportedChecksumAlgorithms = 'sha1,md5,sha256';
 
-  TusUploadRoute() {
-    final tempDir = Directory(_tempDirPath);
+  final String tempDirPath;
+  final int? maxSize; // Maximum allowed upload size in bytes
+
+  // Event hooks
+  final Future<void> Function(Session session, TusUploadSession uploadSession, Map<String, String> metadata)? onUploadCreate;
+  final Future<void> Function(Session session, TusUploadSession uploadSession)? onUploadFinish;
+  final Future<void> Function(Session session, String fileId)? onUploadCancel;
+  final Future<void> Function(Session session, TusUploadSession uploadSession, int chunkSize)? onChunkComplete;
+
+  TusUploadRoute({
+    this.tempDirPath = _defaultTempDirPath,
+    this.maxSize,
+    this.onUploadCreate,
+    this.onUploadFinish,
+    this.onUploadCancel,
+    this.onChunkComplete,
+  }) {
+    final tempDir = Directory(tempDirPath);
     if (!tempDir.existsSync()) {
       tempDir.createSync(recursive: true);
     }
@@ -86,6 +100,7 @@ class TusUploadRoute extends Route {
         'Tus-Extension':
             'creation,creation-with-upload,creation-defer-length,expiration,checksum,termination,concatenation',
         'Tus-Checksum-Algorithm': _supportedChecksumAlgorithms,
+        if (maxSize != null) 'Tus-Max-Size': maxSize.toString(),
       }),
     );
   }
@@ -114,9 +129,7 @@ class TusUploadRoute extends Route {
     int? uploadLength;
     bool isDeferred = false;
 
-    if (concatType == 'final') {
-      // Final concatenation does not require Upload-Length
-    } else {
+    if (concatType != 'final') {
       final rawDeferLength = _getHeader(request, 'upload-defer-length');
       if (rawDeferLength == '1') {
         isDeferred = true;
@@ -137,10 +150,19 @@ class TusUploadRoute extends Route {
             body: Body.text('Invalid Upload-Length value'),
           );
         }
+
+        // Validate max size limit
+        if (maxSize != null && uploadLength > maxSize!) {
+          return Response(
+            statusCode: 413, // Payload Too Large
+            headers: _buildHeaders(extraHeaders: {'Tus-Max-Size': maxSize.toString()}),
+            body: Body.text('Upload-Length exceeds maximum allowed size ($maxSize bytes)'),
+          );
+        }
       }
     }
 
-    final metadata = _getHeader(request, 'upload-metadata');
+    final rawMetadata = _getHeader(request, 'upload-metadata');
     final fileId = const Uuid().v4();
     final expiresAt = DateTime.now().toUtc().add(const Duration(hours: 24));
 
@@ -148,7 +170,7 @@ class TusUploadRoute extends Route {
       fileId: fileId,
       uploadLength: uploadLength,
       uploadOffset: 0,
-      metadata: metadata,
+      metadata: rawMetadata,
       isDeferredLength: isDeferred,
       concatType: concatType,
       concatParts: concatParts,
@@ -158,9 +180,15 @@ class TusUploadRoute extends Route {
 
     await TusUploadSession.db.insertRow(session, uploadSession);
 
-    final tempFile = File('$_tempDirPath/$fileId');
+    final tempFile = File('$tempDirPath/$fileId');
     if (!await tempFile.exists()) {
       await tempFile.create(recursive: true);
+    }
+
+    // Trigger onUploadCreate hook
+    if (onUploadCreate != null) {
+      final parsedMetadata = parseMetadata(rawMetadata);
+      await onUploadCreate!(session, uploadSession, parsedMetadata);
     }
 
     // Handle Concatenation final creation
@@ -187,13 +215,12 @@ class TusUploadRoute extends Route {
           );
         }
 
-        final partFile = File('$_tempDirPath/$partId');
+        final partFile = File('$tempDirPath/$partId');
         if (await partFile.exists()) {
           final stream = partFile.openRead();
           await sink.addStream(stream);
           combinedLength += await partFile.length();
         } else {
-          // Check if already in cloud storage
           final bytes = await session.storage.retrieveFile(
             storageId: 'public',
             path: partId,
@@ -223,16 +250,19 @@ class TusUploadRoute extends Route {
       if (await tempFile.exists()) {
         await tempFile.delete();
       }
+
+      if (onUploadFinish != null) {
+        await onUploadFinish!(session, uploadSession);
+      }
     }
 
-    // Handle Creation With Upload extension if request body is present and contentType is application/offset+octet-stream
+    // Handle Creation With Upload extension
     final contentType = _getHeader(request, 'content-type');
     if (concatType != 'final' &&
         contentType != null &&
         contentType.contains('application/offset+octet-stream')) {
       final bodyBytes = await _readStreamBytes(request.read());
       if (bodyBytes.isNotEmpty) {
-        // Check optional Upload-Checksum header
         final checksumHeader = _getHeader(request, 'upload-checksum');
         if (checksumHeader != null) {
           final verifyErr = _verifyChecksum(bodyBytes, checksumHeader);
@@ -245,6 +275,10 @@ class TusUploadRoute extends Route {
         final currentOffset = bodyBytes.length;
         uploadSession.uploadOffset = currentOffset;
 
+        if (onChunkComplete != null) {
+          await onChunkComplete!(session, uploadSession, bodyBytes.length);
+        }
+
         if (uploadLength != null && currentOffset >= uploadLength) {
           uploadSession.isComplete = true;
           await session.storage.storeFile(
@@ -254,6 +288,10 @@ class TusUploadRoute extends Route {
           );
           if (await tempFile.exists()) {
             await tempFile.delete();
+          }
+
+          if (onUploadFinish != null) {
+            await onUploadFinish!(session, uploadSession);
           }
         }
 
@@ -367,7 +405,7 @@ class TusUploadRoute extends Route {
 
     if (uploadSession.concatType == 'final') {
       return Response(
-        statusCode: 403, // Forbidden to PATCH final concat resource
+        statusCode: 403,
         headers: _buildHeaders(),
         body: Body.text('Cannot PATCH a final concatenated upload'),
       );
@@ -386,7 +424,7 @@ class TusUploadRoute extends Route {
 
     if (clientOffset == null || clientOffset != uploadSession.uploadOffset) {
       return Response(
-        statusCode: 409, // Conflict
+        statusCode: 409,
         headers: _buildHeaders(extraHeaders: {
           'Tus-Resumable': _tusVersion,
           'Upload-Offset': uploadSession.uploadOffset.toString(),
@@ -395,12 +433,18 @@ class TusUploadRoute extends Route {
       );
     }
 
-    // Handle deferred length provided on PATCH
     if (uploadSession.isDeferredLength && uploadSession.uploadLength == null) {
       final newLengthHeader = _getHeader(request, 'upload-length');
       if (newLengthHeader != null) {
         final parsedLength = int.tryParse(newLengthHeader);
         if (parsedLength != null && parsedLength >= uploadSession.uploadOffset) {
+          if (maxSize != null && parsedLength > maxSize!) {
+            return Response(
+              statusCode: 413,
+              headers: _buildHeaders(extraHeaders: {'Tus-Max-Size': maxSize.toString()}),
+              body: Body.text('Upload-Length exceeds maximum allowed size ($maxSize bytes)'),
+            );
+          }
           uploadSession.uploadLength = parsedLength;
           uploadSession.isDeferredLength = false;
         }
@@ -409,7 +453,6 @@ class TusUploadRoute extends Route {
 
     final chunkBytes = await _readStreamBytes(request.read());
 
-    // Validate Upload-Checksum if provided
     final checksumHeader = _getHeader(request, 'upload-checksum');
     if (checksumHeader != null) {
       final verifyErr = _verifyChecksum(chunkBytes, checksumHeader);
@@ -418,11 +461,15 @@ class TusUploadRoute extends Route {
       }
     }
 
-    final tempFile = File('$_tempDirPath/$fileId');
+    final tempFile = File('$tempDirPath/$fileId');
     await tempFile.writeAsBytes(chunkBytes, mode: FileMode.append);
 
     final newOffset = uploadSession.uploadOffset + chunkBytes.length;
     uploadSession.uploadOffset = newOffset;
+
+    if (onChunkComplete != null) {
+      await onChunkComplete!(session, uploadSession, chunkBytes.length);
+    }
 
     final isComplete =
         uploadSession.uploadLength != null && newOffset >= uploadSession.uploadLength!;
@@ -440,6 +487,10 @@ class TusUploadRoute extends Route {
 
       if (await tempFile.exists()) {
         await tempFile.delete();
+      }
+
+      if (onUploadFinish != null) {
+        await onUploadFinish!(session, uploadSession);
       }
     }
 
@@ -477,12 +528,16 @@ class TusUploadRoute extends Route {
       );
     }
 
-    final tempFile = File('$_tempDirPath/$fileId');
+    final tempFile = File('$tempDirPath/$fileId');
     if (await tempFile.exists()) {
       await tempFile.delete();
     }
 
     await TusUploadSession.db.deleteRow(session, uploadSession);
+
+    if (onUploadCancel != null) {
+      await onUploadCancel!(session, fileId);
+    }
 
     return Response(
       statusCode: 204,
@@ -492,7 +547,57 @@ class TusUploadRoute extends Route {
     );
   }
 
-  /// Helper to verify Upload-Checksum header against payload bytes
+  /// Utility method to purge expired upload sessions and temporary disk files
+  Future<int> cleanExpiredUploads(Session session) async {
+    final now = DateTime.now().toUtc();
+    final expiredSessions = await TusUploadSession.db.find(
+      session,
+      where: (t) => t.expiresAt.lessThan(now) & t.isComplete.equals(false),
+    );
+
+    int count = 0;
+    for (final s in expiredSessions) {
+      final tempFile = File('$tempDirPath/${s.fileId}');
+      if (await tempFile.exists()) {
+        await tempFile.delete();
+      }
+      await TusUploadSession.db.deleteRow(session, s);
+      count++;
+    }
+    return count;
+  }
+
+  /// Utility method to parse Base64 encoded Upload-Metadata header string
+  static Map<String, String> parseMetadata(String? metadataHeader) {
+    if (metadataHeader == null || metadataHeader.trim().isEmpty) {
+      return {};
+    }
+
+    final metadata = <String, String>{};
+    final pairs = metadataHeader.trim().split(',');
+
+    for (final pair in pairs) {
+      final parts = pair.trim().split(' ');
+      if (parts.isEmpty) continue;
+
+      final key = parts[0].trim();
+      if (key.isEmpty) continue;
+
+      if (parts.length > 1) {
+        try {
+          final decodedValue = utf8.decode(base64.decode(parts[1].trim()));
+          metadata[key] = decodedValue;
+        } catch (_) {
+          metadata[key] = parts[1].trim();
+        }
+      } else {
+        metadata[key] = '';
+      }
+    }
+
+    return metadata;
+  }
+
   Response? _verifyChecksum(Uint8List bytes, String checksumHeader) {
     final parts = checksumHeader.trim().split(' ');
     if (parts.length != 2) {
@@ -528,7 +633,7 @@ class TusUploadRoute extends Route {
     final actualBase64 = base64.encode(digest.bytes);
     if (actualBase64 != expectedBase64) {
       return Response(
-        statusCode: 460, // TUS Checksum Mismatch status code
+        statusCode: 460,
         headers: _buildHeaders(),
         body: Body.text('Checksum Mismatch'),
       );
@@ -537,7 +642,6 @@ class TusUploadRoute extends Route {
     return null;
   }
 
-  /// Helper to convert byte stream to Uint8List
   Future<Uint8List> _readStreamBytes(Stream<List<int>> stream) async {
     final builder = BytesBuilder();
     await for (final chunk in stream) {
@@ -546,12 +650,10 @@ class TusUploadRoute extends Route {
     return builder.takeBytes();
   }
 
-  /// Format DateTime to RFC 9110 HTTP-date format (e.g. Wed, 25 Jun 2024 16:00:00 GMT)
   String _formatHttpDate(DateTime date) {
     return HttpDate.format(date.toUtc());
   }
 
-  /// Build CORS & TUS headers
   Map<String, String> _buildHeaders({Map<String, String>? extraHeaders}) {
     final headers = <String, String>{
       'Access-Control-Allow-Origin': '*',

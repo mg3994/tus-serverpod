@@ -2,16 +2,20 @@
 
 This implementation provides a native, production-ready, full-featured implementation of the [tus resumable upload protocol v1.0.0](https://tus.io/protocols/resumable-upload) built directly into Serverpod 4.1.0-beta.1 using Serverpod's built-in Relic web server, Serverpod ORM, and cloud storage features.
 
-## Implemented Protocol Extensions
+## Protocol Features & Extensions
 - **Core Protocol**: `HEAD`, `PATCH`, `OPTIONS`
-- **Creation (`creation`)**: `POST` request to initialize upload resource with `Upload-Length` or `Upload-Metadata`
-- **Creation With Upload (`creation-with-upload`)**: Initial upload data chunk inside `POST` creation request
-- **Creation Defer Length (`creation-defer-length`)**: Deferred size specification via `Upload-Defer-Length: 1`
+- **Creation (`creation`)**: `POST` request to initialize upload resource
+- **Creation With Upload (`creation-with-upload`)**: Upload chunk inside `POST` creation request
+- **Creation Defer Length (`creation-defer-length`)**: Deferred length via `Upload-Defer-Length: 1`
 - **Expiration (`expiration`)**: `Upload-Expires` tracking in RFC 9110 HTTP-date format
-- **Checksum (`checksum`)**: Integrity validation via `Upload-Checksum` supporting `sha1`, `md5`, and `sha256` (returning HTTP `460 Checksum Mismatch` on failure)
-- **Termination (`termination`)**: `DELETE` method to cancel upload and release resources
-- **Concatenation (`concatenation`)**: Concatenate partial uploads (`Upload-Concat: partial` & `final;...`) for parallel chunk uploads
-- **Method Override**: `X-HTTP-Method-Override` support for restricted environments
+- **Checksum (`checksum`)**: Payload integrity validation supporting `sha1`, `md5`, and `sha256` (returning HTTP `460 Checksum Mismatch` on failure)
+- **Termination (`termination`)**: `DELETE` method to cancel upload and free resources
+- **Concatenation (`concatenation`)**: Concatenate partial uploads (`Upload-Concat: partial` & `final;...`)
+- **Max Size Limits**: Enforces `maxSize` and responds with HTTP `413 Payload Too Large`
+- **Event Hooks**: `onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`
+- **Metadata Parser**: Base64 `Upload-Metadata` parser (`TusUploadRoute.parseMetadata`)
+- **Cleanup Utility**: Purge expired abandoned uploads via `cleanExpiredUploads`
+- **Method Override**: `X-HTTP-Method-Override` support for restricted clients
 
 ---
 
@@ -55,80 +59,7 @@ import 'package:uuid/uuid.dart';
 
 import '../generated/protocol.dart';
 
-/// Full-featured, production-ready TUS (Resumable Upload Protocol v1.0.0) Server Route.
-class TusUploadRoute extends Route {
-  static const String _tempDirPath = '/tmp/tus_uploads';
-  static const String _tusVersion = '1.0.0';
-  static const String _supportedChecksumAlgorithms = 'sha1,md5,sha256';
-
-  TusUploadRoute() {
-    final tempDir = Directory(_tempDirPath);
-    if (!tempDir.existsSync()) {
-      tempDir.createSync(recursive: true);
-    }
-  }
-
-  @override
-  Future<Response> handleCall(Session session, Request request) async {
-    final overrideMethod = _getHeader(request, 'x-http-method-override');
-    final method = (overrideMethod ?? request.method.value).toUpperCase();
-
-    final clientTusVersion = _getHeader(request, 'tus-resumable');
-    if (method != 'OPTIONS' && clientTusVersion != null && clientTusVersion != _tusVersion) {
-      return Response(
-        statusCode: 412,
-        headers: _buildHeaders(extraHeaders: {'Tus-Version': _tusVersion}),
-        body: Body.text('Precondition Failed: Unsupported TUS Protocol Version'),
-      );
-    }
-
-    try {
-      switch (method) {
-        case 'OPTIONS':
-          return _handleOptions(request);
-        case 'POST':
-          return await _handlePost(session, request);
-        case 'HEAD':
-          return await _handleHead(session, request);
-        case 'PATCH':
-          return await _handlePatch(session, request);
-        case 'DELETE':
-          return await _handleDelete(session, request);
-        default:
-          return Response(
-            statusCode: 405,
-            headers: _buildHeaders(),
-            body: Body.text('Method Not Allowed'),
-          );
-      }
-    } catch (e, stackTrace) {
-      session.log('Error handling TUS request: $e\n$stackTrace', level: LogLevel.error);
-      return Response(
-        statusCode: 500,
-        headers: _buildHeaders(),
-        body: Body.text('Internal Server Error: ${e.toString()}'),
-      );
-    }
-  }
-
-  Response _handleOptions(Request request) {
-    return Response(
-      statusCode: 204,
-      headers: _buildHeaders(extraHeaders: {
-        'Tus-Resumable': _tusVersion,
-        'Tus-Version': _tusVersion,
-        'Tus-Extension':
-            'creation,creation-with-upload,creation-defer-length,expiration,checksum,termination,concatenation',
-        'Tus-Checksum-Algorithm': _supportedChecksumAlgorithms,
-      }),
-    );
-  }
-
-  Future<Response> _handlePost(Session session, Request request) async { ... }
-  Future<Response> _handleHead(Session session, Request request) async { ... }
-  Future<Response> _handlePatch(Session session, Request request) async { ... }
-  Future<Response> _handleDelete(Session session, Request request) async { ... }
-}
+class TusUploadRoute extends Route { ... }
 ```
 
 ---
@@ -144,7 +75,24 @@ import 'routes/tus_upload_route.dart';
 
 void run(List<String> args) async {
   final pod = Serverpod(args);
-  pod.webServer.addRoute(TusUploadRoute(), '/tus/*');
+
+  final tusRoute = TusUploadRoute(
+    maxSize: 5 * 1024 * 1024 * 1024, // 5 GB
+    onUploadCreate: (session, uploadSession, metadata) async {
+      session.log('Upload created: ${uploadSession.fileId}');
+    },
+    onChunkComplete: (session, uploadSession, chunkSize) async {
+      session.log('Chunk received: $chunkSize bytes');
+    },
+    onUploadFinish: (session, uploadSession) async {
+      session.log('Upload completed: ${uploadSession.fileId}');
+    },
+    onUploadCancel: (session, fileId) async {
+      session.log('Upload cancelled: $fileId');
+    },
+  );
+
+  pod.webServer.addRoute(tusRoute, '/tus/*');
   await pod.start();
 }
 ```
