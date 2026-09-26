@@ -97,7 +97,7 @@ void run(List<String> args) async {
     },
   );
 
-  // Optional: start background expiration cleanup worker
+  // Start background expiration cleanup worker
   tusRoute.startExpirationCleanupWorker(pod);
 
   pod.webServer.addRoute(tusRoute, '/tus/*');

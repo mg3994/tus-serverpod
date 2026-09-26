@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
@@ -7,7 +6,7 @@ import 'package:test/test.dart';
 import '../lib/src/routes/tus_upload_route.dart';
 
 void main() {
-  group('TusUploadRoute Unit & Architecture Tests', () {
+  group('TusUploadRoute Complete Unit Tests', () {
     test('parseMetadata correctly parses Base64 encoded metadata string', () {
       final filenameBase64 = base64.encode(utf8.encode('test_document.pdf'));
       final rawHeader = 'filename $filenameBase64,is_confidential';
@@ -37,7 +36,31 @@ void main() {
       expect(md5Base64, equals('5EB63BBBE01EEED093CB22BB8F5ACDC3'.toLowerCase()));
     });
 
-    test('TusUploadRoute constructor initializes custom tempDirPath, maxSize, and expirationDuration', () {
+    test('verifyChecksum returns null for valid SHA1, MD5, SHA256 hashes', () {
+      final route = TusUploadRoute();
+      final bytes = Uint8List.fromList(utf8.encode('hello world'));
+
+      final sha1Base64 = base64.encode(sha1.convert(bytes).bytes);
+      final md5Base64 = base64.encode(md5.convert(bytes).bytes);
+      final sha256Base64 = base64.encode(sha256.convert(bytes).bytes);
+
+      expect(route.verifyChecksum(bytes, 'sha1 $sha1Base64'), isNull);
+      expect(route.verifyChecksum(bytes, 'md5 $md5Base64'), isNull);
+      expect(route.verifyChecksum(bytes, 'sha256 $sha256Base64'), isNull);
+    });
+
+    test('verifyChecksum returns 460 Response on checksum mismatch', () {
+      final route = TusUploadRoute();
+      final bytes = Uint8List.fromList(utf8.encode('hello world'));
+
+      final invalidChecksumHeader = 'sha1 invalid_checksum_hash=';
+      final response = route.verifyChecksum(bytes, invalidChecksumHeader);
+
+      expect(response, isNotNull);
+      expect(response!.statusCode, equals(460));
+    });
+
+    test('TusUploadRoute constructor initializes custom parameters', () {
       final customDuration = const Duration(hours: 48);
       final route = TusUploadRoute(
         tempDirPath: '/tmp/custom_tus',

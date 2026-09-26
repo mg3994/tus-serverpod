@@ -11,17 +11,17 @@ import '../generated/protocol.dart';
 
 /// Full-featured, production-ready TUS (Resumable Upload Protocol v1.0.0) Server Route.
 ///
-/// Native implementation built for Serverpod 4 using Relic Web Server, ORM, and Cloud Storage.
+/// Built natively for Serverpod 4 using Relic Web Server, ORM, and Cloud Storage.
 ///
-/// Features & Extensions:
+/// Supported Specification & Extensions:
 /// - Core Protocol (`HEAD`, `PATCH`, `OPTIONS`, `GET`)
 /// - Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
-/// - Sliding Window Expiration: Every valid `PATCH` request automatically extends `expiresAt` (e.g. by 24h), allowing active retries to continue seamlessly.
-/// - Per-upload Concurrency Locking (prevents parallel PATCH race conditions on the same resource)
-/// - Expiration enforcement (`410 Gone` on expired sessions) & `startExpirationCleanupWorker`
-/// - Configurable upload size limit (`Tus-Max-Size`)
-/// - Event Hooks (`onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`)
-/// - Base64 Metadata parsing (`parseMetadata`)
+/// - Sliding Window Expiration: Extends `expiresAt` on every active chunk upload (`PATCH`).
+/// - Per-upload Concurrency Locking (`_locks`) preventing race conditions during parallel requests.
+/// - Expiration enforcement (`410 Gone` on expired sessions) & `startExpirationCleanupWorker` background worker.
+/// - Configurable upload size limit (`Tus-Max-Size`).
+/// - Lifecycle Event Hooks (`onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`).
+/// - Base64 Metadata parsing (`parseMetadata`).
 class TusUploadRoute extends Route {
   static const String _defaultTempDirPath = '/tmp/tus_uploads';
   static const String _tusVersion = '1.0.0';
@@ -155,11 +155,12 @@ class TusUploadRoute extends Route {
     String? concatParts;
 
     if (concatHeader != null) {
-      if (concatHeader.trim().toLowerCase() == 'partial') {
+      final trimmed = concatHeader.trim();
+      if (trimmed.toLowerCase() == 'partial') {
         concatType = 'partial';
-      } else if (concatHeader.trim().toLowerCase().startsWith('final;')) {
+      } else if (trimmed.toLowerCase().startsWith('final;')) {
         concatType = 'final';
-        concatParts = concatHeader.trim().substring(6).trim();
+        concatParts = trimmed.substring(6).trim();
       } else {
         return Response(
           statusCode: 400,
@@ -239,7 +240,11 @@ class TusUploadRoute extends Route {
 
       int combinedLength = 0;
       for (final partPath in parts) {
-        final partId = partPath.split('/').where((s) => s.isNotEmpty).last;
+        final partUri = Uri.tryParse(partPath);
+        final partId = (partUri != null && partUri.pathSegments.isNotEmpty)
+            ? partUri.pathSegments.last
+            : partPath.split('/').where((s) => s.isNotEmpty).last;
+
         final partSession = await TusUploadSession.db.findFirstRow(
           session,
           where: (t) => t.fileId.equals(partId),
@@ -306,7 +311,7 @@ class TusUploadRoute extends Route {
       if (bodyBytes.isNotEmpty) {
         final checksumHeader = _getHeader(request, 'upload-checksum');
         if (checksumHeader != null) {
-          final verifyErr = _verifyChecksum(bodyBytes, checksumHeader);
+          final verifyErr = verifyChecksum(bodyBytes, checksumHeader);
           if (verifyErr != null) {
             return verifyErr;
           }
@@ -513,7 +518,7 @@ class TusUploadRoute extends Route {
 
     final checksumHeader = _getHeader(request, 'upload-checksum');
     if (checksumHeader != null) {
-      final verifyErr = _verifyChecksum(chunkBytes, checksumHeader);
+      final verifyErr = verifyChecksum(chunkBytes, checksumHeader);
       if (verifyErr != null) {
         return verifyErr;
       }
@@ -737,7 +742,8 @@ class TusUploadRoute extends Route {
     return metadata;
   }
 
-  Response? _verifyChecksum(Uint8List bytes, String checksumHeader) {
+  /// Checksum verification helper
+  Response? verifyChecksum(Uint8List bytes, String checksumHeader) {
     final parts = checksumHeader.trim().split(' ');
     if (parts.length != 2) {
       return Response(
