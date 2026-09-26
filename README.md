@@ -3,11 +3,11 @@
 This implementation provides a native, production-ready, full-featured implementation of the [tus resumable upload protocol v1.0.0](https://tus.io/protocols/resumable-upload) built directly into Serverpod 4.1.0-beta.1 using Serverpod's built-in Relic web server, Serverpod ORM, and cloud storage features.
 
 ## Protocol Features & Extensions
-- **Core Protocol**: `HEAD`, `PATCH`, `OPTIONS`
+- **Core Protocol**: `HEAD`, `PATCH`, `OPTIONS`, `GET`
 - **Creation (`creation`)**: `POST` request to initialize upload resource
 - **Creation With Upload (`creation-with-upload`)**: Upload chunk inside `POST` creation request
 - **Creation Defer Length (`creation-defer-length`)**: Deferred length via `Upload-Defer-Length: 1`
-- **Expiration (`expiration`)**: `Upload-Expires` tracking in RFC 9110 HTTP-date format
+- **Expiration (`expiration`)**: `Upload-Expires` tracking in RFC 9110 HTTP-date format, with `410 Gone` on expired sessions
 - **Checksum (`checksum`)**: Payload integrity validation supporting `sha1`, `md5`, and `sha256` (returning HTTP `460 Checksum Mismatch` on failure)
 - **Termination (`termination`)**: `DELETE` method to cancel upload and free resources
 - **Concatenation (`concatenation`)**: Concatenate partial uploads (`Upload-Concat: partial` & `final;...`)

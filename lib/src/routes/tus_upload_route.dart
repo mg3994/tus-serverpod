@@ -10,13 +10,14 @@ import '../generated/protocol.dart';
 
 /// Full-featured, production-ready TUS (Resumable Upload Protocol v1.0.0) Server Route.
 ///
-/// Inspired by official `@tus/server` architecture:
-/// - Core Protocol (`HEAD`, `PATCH`, `OPTIONS`)
-/// - Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
-/// - Max size limits (`Tus-Max-Size` enforcement returning 413)
+/// Implements:
+/// - Core Protocol (`HEAD`, `PATCH`, `OPTIONS`, `GET`)
+/// - Protocol Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
+/// - Expiration enforcement (`410 Gone` on expired incomplete uploads)
+/// - Configurable upload size limit (`Tus-Max-Size`)
 /// - Event Hooks (`onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`)
-/// - Metadata Base64 Parser (`parseMetadata`)
-/// - Expired uploads cleanup utility (`cleanExpiredUploads`)
+/// - Base64 Metadata parsing
+/// - Purge expired uploads utility (`cleanExpiredUploads`)
 class TusUploadRoute extends Route {
   static const String _defaultTempDirPath = '/tmp/tus_uploads';
   static const String _tusVersion = '1.0.0';
@@ -26,10 +27,24 @@ class TusUploadRoute extends Route {
   final int? maxSize; // Maximum allowed upload size in bytes
 
   // Event hooks
-  final Future<void> Function(Session session, TusUploadSession uploadSession, Map<String, String> metadata)? onUploadCreate;
-  final Future<void> Function(Session session, TusUploadSession uploadSession)? onUploadFinish;
-  final Future<void> Function(Session session, String fileId)? onUploadCancel;
-  final Future<void> Function(Session session, TusUploadSession uploadSession, int chunkSize)? onChunkComplete;
+  final Future<void> Function(
+    Session session,
+    TusUploadSession uploadSession,
+    Map<String, String> metadata,
+  )? onUploadCreate;
+  final Future<void> Function(
+    Session session,
+    TusUploadSession uploadSession,
+  )? onUploadFinish;
+  final Future<void> Function(
+    Session session,
+    String fileId,
+  )? onUploadCancel;
+  final Future<void> Function(
+    Session session,
+    TusUploadSession uploadSession,
+    int chunkSize,
+  )? onChunkComplete;
 
   TusUploadRoute({
     this.tempDirPath = _defaultTempDirPath,
@@ -47,11 +62,9 @@ class TusUploadRoute extends Route {
 
   @override
   Future<Response> handleCall(Session session, Request request) async {
-    // Support X-HTTP-Method-Override header
     final overrideMethod = _getHeader(request, 'x-http-method-override');
     final method = (overrideMethod ?? request.method.value).toUpperCase();
 
-    // Verify TUS protocol version for non-OPTIONS requests if provided
     final clientTusVersion = _getHeader(request, 'tus-resumable');
     if (method != 'OPTIONS' && clientTusVersion != null && clientTusVersion != _tusVersion) {
       return Response(
@@ -73,6 +86,8 @@ class TusUploadRoute extends Route {
           return await _handlePatch(session, request);
         case 'DELETE':
           return await _handleDelete(session, request);
+        case 'GET':
+          return await _handleGet(session, request);
         default:
           return Response(
             statusCode: 405, // Method Not Allowed
@@ -90,7 +105,7 @@ class TusUploadRoute extends Route {
     }
   }
 
-  /// OPTIONS: Capabilities discovery
+  /// OPTIONS: Server capabilities preflight
   Response _handleOptions(Request request) {
     return Response(
       statusCode: 204,
@@ -151,7 +166,6 @@ class TusUploadRoute extends Route {
           );
         }
 
-        // Validate max size limit
         if (maxSize != null && uploadLength > maxSize!) {
           return Response(
             statusCode: 413, // Payload Too Large
@@ -166,7 +180,7 @@ class TusUploadRoute extends Route {
     final fileId = const Uuid().v4();
     final expiresAt = DateTime.now().toUtc().add(const Duration(hours: 24));
 
-    final uploadSession = TusUploadSession(
+    final initialSession = TusUploadSession(
       fileId: fileId,
       uploadLength: uploadLength,
       uploadOffset: 0,
@@ -178,20 +192,20 @@ class TusUploadRoute extends Route {
       expiresAt: expiresAt,
     );
 
-    await TusUploadSession.db.insertRow(session, uploadSession);
+    // Reassign inserted session object so primary key ID is populated
+    var uploadSession = await TusUploadSession.db.insertRow(session, initialSession);
 
     final tempFile = File('$tempDirPath/$fileId');
     if (!await tempFile.exists()) {
       await tempFile.create(recursive: true);
     }
 
-    // Trigger onUploadCreate hook
     if (onUploadCreate != null) {
       final parsedMetadata = parseMetadata(rawMetadata);
       await onUploadCreate!(session, uploadSession, parsedMetadata);
     }
 
-    // Handle Concatenation final creation
+    // Concatenation final creation
     if (concatType == 'final') {
       final parts = concatParts!.split(' ').where((s) => s.isNotEmpty).toList();
       final sink = tempFile.openWrite(mode: FileMode.append);
@@ -238,7 +252,7 @@ class TusUploadRoute extends Route {
       uploadSession.uploadLength = combinedLength;
       uploadSession.uploadOffset = combinedLength;
       uploadSession.isComplete = true;
-      await TusUploadSession.db.updateRow(session, uploadSession);
+      uploadSession = await TusUploadSession.db.updateRow(session, uploadSession);
 
       final completedBytes = await tempFile.readAsBytes();
       await session.storage.storeFile(
@@ -256,7 +270,7 @@ class TusUploadRoute extends Route {
       }
     }
 
-    // Handle Creation With Upload extension
+    // Creation With Upload
     final contentType = _getHeader(request, 'content-type');
     if (concatType != 'final' &&
         contentType != null &&
@@ -295,7 +309,7 @@ class TusUploadRoute extends Route {
           }
         }
 
-        await TusUploadSession.db.updateRow(session, uploadSession);
+        uploadSession = await TusUploadSession.db.updateRow(session, uploadSession);
       }
     }
 
@@ -336,6 +350,15 @@ class TusUploadRoute extends Route {
         statusCode: 404,
         headers: _buildHeaders(),
         body: Body.text('Upload session not found'),
+      );
+    }
+
+    // Expiration check
+    if (!uploadSession.isComplete && uploadSession.expiresAt.isBefore(DateTime.now().toUtc())) {
+      return Response(
+        statusCode: 410, // Gone
+        headers: _buildHeaders(),
+        body: Body.text('Upload session has expired'),
       );
     }
 
@@ -390,7 +413,7 @@ class TusUploadRoute extends Route {
       );
     }
 
-    final uploadSession = await TusUploadSession.db.findFirstRow(
+    var uploadSession = await TusUploadSession.db.findFirstRow(
       session,
       where: (t) => t.fileId.equals(fileId),
     );
@@ -400,6 +423,15 @@ class TusUploadRoute extends Route {
         statusCode: 404,
         headers: _buildHeaders(),
         body: Body.text('Upload session not found'),
+      );
+    }
+
+    // Expiration check
+    if (!uploadSession.isComplete && uploadSession.expiresAt.isBefore(DateTime.now().toUtc())) {
+      return Response(
+        statusCode: 410, // Gone
+        headers: _buildHeaders(),
+        body: Body.text('Upload session has expired'),
       );
     }
 
@@ -475,7 +507,7 @@ class TusUploadRoute extends Route {
         uploadSession.uploadLength != null && newOffset >= uploadSession.uploadLength!;
     uploadSession.isComplete = isComplete;
 
-    await TusUploadSession.db.updateRow(session, uploadSession);
+    uploadSession = await TusUploadSession.db.updateRow(session, uploadSession);
 
     if (isComplete) {
       final fileBytes = await tempFile.readAsBytes();
@@ -544,6 +576,63 @@ class TusUploadRoute extends Route {
       headers: _buildHeaders(extraHeaders: {
         'Tus-Resumable': _tusVersion,
       }),
+    );
+  }
+
+  /// GET: Download completed uploaded file
+  Future<Response> _handleGet(Session session, Request request) async {
+    final fileId = _extractFileId(request);
+    if (fileId == null) {
+      return Response(
+        statusCode: 400,
+        headers: _buildHeaders(),
+        body: Body.text('Missing file ID in URL'),
+      );
+    }
+
+    final uploadSession = await TusUploadSession.db.findFirstRow(
+      session,
+      where: (t) => t.fileId.equals(fileId),
+    );
+
+    if (uploadSession == null) {
+      return Response(
+        statusCode: 404,
+        headers: _buildHeaders(),
+        body: Body.text('File not found'),
+      );
+    }
+
+    if (!uploadSession.isComplete) {
+      return Response(
+        statusCode: 400,
+        headers: _buildHeaders(),
+        body: Body.text('Upload is still in progress'),
+      );
+    }
+
+    final byteData = await session.storage.retrieveFile(
+      storageId: 'public',
+      path: fileId,
+    );
+
+    if (byteData == null) {
+      return Response(
+        statusCode: 404,
+        headers: _buildHeaders(),
+        body: Body.text('File missing from storage'),
+      );
+    }
+
+    final uint8List = byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes);
+
+    return Response(
+      statusCode: 200,
+      headers: _buildHeaders(extraHeaders: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': uint8List.length.toString(),
+      }),
+      body: Body.binary(uint8List),
     );
   }
 
