@@ -2,9 +2,12 @@ class: TusUploadSession
 table: tus_upload_session
 fields:
   fileId: String
-  uploadLength: int
+  uploadLength: int?
   uploadOffset: int
   metadata: String?
+  isDeferredLength: bool, default=false
+  concatType: String?
+  concatParts: String?
   isComplete: bool, default=false
   expiresAt: DateTime
 indexes:
