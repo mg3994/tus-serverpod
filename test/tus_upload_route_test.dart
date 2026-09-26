@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
@@ -6,7 +7,7 @@ import 'package:test/test.dart';
 import '../lib/src/routes/tus_upload_route.dart';
 
 void main() {
-  group('TusUploadRoute Helper Unit Tests', () {
+  group('TusUploadRoute Unit & Architecture Tests', () {
     test('parseMetadata correctly parses Base64 encoded metadata string', () {
       final filenameBase64 = base64.encode(utf8.encode('test_document.pdf'));
       final rawHeader = 'filename $filenameBase64,is_confidential';
@@ -34,6 +35,16 @@ void main() {
 
       expect(sha1Base64, equals('Kq5sNclPz7QV2+lfQIuc6R7oRu0='));
       expect(md5Base64, equals('5EB63BBBE01EEED093CB22BB8F5ACDC3'.toLowerCase()));
+    });
+
+    test('TusUploadRoute constructor initializes custom tempDirPath and maxSize', () {
+      final route = TusUploadRoute(
+        tempDirPath: '/tmp/custom_tus',
+        maxSize: 1024 * 1024,
+      );
+
+      expect(route.tempDirPath, equals('/tmp/custom_tus'));
+      expect(route.maxSize, equals(1024 * 1024));
     });
   });
 }

@@ -11,6 +11,8 @@ This implementation provides a native, production-ready, full-featured implement
 - **Checksum (`checksum`)**: Payload integrity validation supporting `sha1`, `md5`, and `sha256` (returning HTTP `460 Checksum Mismatch` on failure)
 - **Termination (`termination`)**: `DELETE` method to cancel upload and free resources
 - **Concatenation (`concatenation`)**: Concatenate partial uploads (`Upload-Concat: partial` & `final;...`)
+- **Concurrency Locking**: Per-file mutex locking (`_locks`) preventing race conditions on concurrent `PATCH` requests
+- **Expiration Worker**: `startExpirationCleanupWorker` background worker to purge abandoned uploads
 - **Max Size Limits**: Enforces `maxSize` and responds with HTTP `413 Payload Too Large`
 - **Event Hooks**: `onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`
 - **Metadata Parser**: Base64 `Upload-Metadata` parser (`TusUploadRoute.parseMetadata`)
@@ -49,6 +51,7 @@ indexes:
 Location: `lib/src/routes/tus_upload_route.dart`
 
 ```dart
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -91,6 +94,9 @@ void run(List<String> args) async {
       session.log('Upload cancelled: $fileId');
     },
   );
+
+  // Optional: start background expiration cleanup worker
+  tusRoute.startExpirationCleanupWorker(pod);
 
   pod.webServer.addRoute(tusRoute, '/tus/*');
   await pod.start();

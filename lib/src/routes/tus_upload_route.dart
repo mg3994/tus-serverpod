@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -10,14 +11,16 @@ import '../generated/protocol.dart';
 
 /// Full-featured, production-ready TUS (Resumable Upload Protocol v1.0.0) Server Route.
 ///
-/// Implements:
+/// Native implementation built for Serverpod 4 using Relic Web Server, ORM, and Cloud Storage.
+///
+/// Features & Extensions:
 /// - Core Protocol (`HEAD`, `PATCH`, `OPTIONS`, `GET`)
-/// - Protocol Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
-/// - Expiration enforcement (`410 Gone` on expired incomplete uploads)
+/// - Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
+/// - Per-upload Concurrency Locking (prevents parallel PATCH race conditions on the same resource)
+/// - Expiration enforcement (`410 Gone` on expired sessions) & `startExpirationCleanupWorker`
 /// - Configurable upload size limit (`Tus-Max-Size`)
 /// - Event Hooks (`onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`)
-/// - Base64 Metadata parsing
-/// - Purge expired uploads utility (`cleanExpiredUploads`)
+/// - Base64 Metadata parsing (`parseMetadata`)
 class TusUploadRoute extends Route {
   static const String _defaultTempDirPath = '/tmp/tus_uploads';
   static const String _tusVersion = '1.0.0';
@@ -25,6 +28,9 @@ class TusUploadRoute extends Route {
 
   final String tempDirPath;
   final int? maxSize; // Maximum allowed upload size in bytes
+
+  // Per-file id concurrency locks
+  final Map<String, Completer<void>> _locks = {};
 
   // Event hooks
   final Future<void> Function(
@@ -83,9 +89,9 @@ class TusUploadRoute extends Route {
         case 'HEAD':
           return await _handleHead(session, request);
         case 'PATCH':
-          return await _handlePatch(session, request);
+          return await _withLock(_extractFileId(request), () => _handlePatch(session, request));
         case 'DELETE':
-          return await _handleDelete(session, request);
+          return await _withLock(_extractFileId(request), () => _handleDelete(session, request));
         case 'GET':
           return await _handleGet(session, request);
         default:
@@ -102,6 +108,25 @@ class TusUploadRoute extends Route {
         headers: _buildHeaders(),
         body: Body.text('Internal Server Error: ${e.toString()}'),
       );
+    }
+  }
+
+  /// Concurrency lock helper ensuring single-thread execution per file ID
+  Future<Response> _withLock(String? fileId, Future<Response> Function() action) async {
+    if (fileId == null) return await action();
+
+    while (_locks.containsKey(fileId)) {
+      await _locks[fileId]!.future;
+    }
+
+    final completer = Completer<void>();
+    _locks[fileId] = completer;
+
+    try {
+      return await action();
+    } finally {
+      _locks.remove(fileId);
+      completer.complete();
     }
   }
 
@@ -192,7 +217,6 @@ class TusUploadRoute extends Route {
       expiresAt: expiresAt,
     );
 
-    // Reassign inserted session object so primary key ID is populated
     var uploadSession = await TusUploadSession.db.insertRow(session, initialSession);
 
     final tempFile = File('$tempDirPath/$fileId');
@@ -426,7 +450,6 @@ class TusUploadRoute extends Route {
       );
     }
 
-    // Expiration check
     if (!uploadSession.isComplete && uploadSession.expiresAt.isBefore(DateTime.now().toUtc())) {
       return Response(
         statusCode: 410, // Gone
@@ -634,6 +657,26 @@ class TusUploadRoute extends Route {
       }),
       body: Body.binary(uint8List),
     );
+  }
+
+  /// Starts a background worker that periodically purges expired uploads
+  Timer startExpirationCleanupWorker(
+    Serverpod pod, {
+    Duration interval = const Duration(hours: 1),
+  }) {
+    return Timer.periodic(interval, (_) async {
+      final session = await pod.createSession();
+      try {
+        final purgedCount = await cleanExpiredUploads(session);
+        if (purgedCount > 0) {
+          session.log('TUS Expiration Worker: Purged $purgedCount expired upload sessions');
+        }
+      } catch (e) {
+        session.log('TUS Expiration Worker error: $e', level: LogLevel.error);
+      } finally {
+        await session.close();
+      }
+    });
   }
 
   /// Utility method to purge expired upload sessions and temporary disk files
