@@ -1,0 +1,9 @@
+class: TusUploadSession
+table: tus_upload_session
+fields:
+  fileId: String, parent=tus_upload_session
+  uploadLength: int
+  uploadOffset: int
+  metadata: String?
+  isComplete: bool
+  expiresAt: DateTime
