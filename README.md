@@ -13,11 +13,12 @@ This implementation provides a native, production-ready, full-featured implement
 - **Termination (`termination`)**: `DELETE` method to cancel upload and free resources
 - **Concatenation (`concatenation`)**: Concatenate partial uploads (`Upload-Concat: partial` & `final;...`)
 - **Concurrency Locking**: Per-file mutex locking (`_locks`) preventing race conditions on concurrent `PATCH` requests
+- **Over-allocation Protection**: Rejects chunks attempting to exceed declared `Upload-Length` with `400 Bad Request`
+- **Orphaned File Purging**: `cleanExpiredUploads` purges expired abandoned temp files and orphaned un-tracked files from local storage
+- **Metadata Parser**: Robust URL-safe & unpadded Base64 `Upload-Metadata` parser (`TusUploadRoute.parseMetadata`)
 - **Expiration Worker**: `startExpirationCleanupWorker` background worker to purge abandoned uploads
 - **Max Size Limits**: Enforces `maxSize` and responds with HTTP `413 Payload Too Large`
 - **Event Hooks**: `onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`
-- **Metadata Parser**: Base64 `Upload-Metadata` parser (`TusUploadRoute.parseMetadata`)
-- **Cleanup Utility**: Purge expired abandoned uploads via `cleanExpiredUploads`
 - **Method Override**: `X-HTTP-Method-Override` support for restricted clients
 
 ---

@@ -18,10 +18,12 @@ import '../generated/protocol.dart';
 /// - Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
 /// - Sliding Window Expiration: Extends `expiresAt` on every active chunk upload (`PATCH`).
 /// - Per-upload Concurrency Locking (`_locks`) preventing race conditions during parallel requests.
+/// - Over-allocation Protection: Rejects chunks attempting to exceed `uploadLength`.
 /// - Expiration enforcement (`410 Gone` on expired sessions) & `startExpirationCleanupWorker` background worker.
+/// - Orphaned File Cleanup: Cleans abandoned files from `tempDirPath` during cleanup runs.
+/// - Robust URL-Safe & Unpadded Base64 Metadata parser (`parseMetadata`).
 /// - Configurable upload size limit (`Tus-Max-Size`).
 /// - Lifecycle Event Hooks (`onUploadCreate`, `onUploadFinish`, `onUploadCancel`, `onChunkComplete`).
-/// - Base64 Metadata parsing (`parseMetadata`).
 class TusUploadRoute extends Route {
   static const String _defaultTempDirPath = '/tmp/tus_uploads';
   static const String _tusVersion = '1.0.0';
@@ -92,9 +94,9 @@ class TusUploadRoute extends Route {
         case 'HEAD':
           return await _handleHead(session, request);
         case 'PATCH':
-          return await _withLock(_extractFileId(request), () => _handlePatch(session, request));
+          return await _withLock(extractFileId(request), () => _handlePatch(session, request));
         case 'DELETE':
-          return await _withLock(_extractFileId(request), () => _handleDelete(session, request));
+          return await _withLock(extractFileId(request), () => _handleDelete(session, request));
         case 'GET':
           return await _handleGet(session, request);
         default:
@@ -317,6 +319,14 @@ class TusUploadRoute extends Route {
           }
         }
 
+        if (uploadLength != null && bodyBytes.length > uploadLength) {
+          return Response(
+            statusCode: 400,
+            headers: _buildHeaders(),
+            body: Body.text('Creation payload size exceeds Upload-Length'),
+          );
+        }
+
         await tempFile.writeAsBytes(bodyBytes, mode: FileMode.append);
         final currentOffset = bodyBytes.length;
         uploadSession.uploadOffset = currentOffset;
@@ -363,7 +373,7 @@ class TusUploadRoute extends Route {
 
   /// HEAD: Status check
   Future<Response> _handleHead(Session session, Request request) async {
-    final fileId = _extractFileId(request);
+    final fileId = extractFileId(request);
     if (fileId == null) {
       return Response(
         statusCode: 400,
@@ -385,7 +395,6 @@ class TusUploadRoute extends Route {
       );
     }
 
-    // Expiration check
     if (!uploadSession.isComplete && uploadSession.expiresAt.isBefore(DateTime.now().toUtc())) {
       return Response(
         statusCode: 410, // Gone
@@ -427,7 +436,7 @@ class TusUploadRoute extends Route {
 
   /// PATCH: Receive upload chunk & slide expiration window
   Future<Response> _handlePatch(Session session, Request request) async {
-    final fileId = _extractFileId(request);
+    final fileId = extractFileId(request);
     if (fileId == null) {
       return Response(
         statusCode: 400,
@@ -516,6 +525,16 @@ class TusUploadRoute extends Route {
 
     final chunkBytes = await _readStreamBytes(request.read());
 
+    // Over-allocation protection: reject chunks exceeding declared uploadLength
+    if (uploadSession.uploadLength != null &&
+        (uploadSession.uploadOffset + chunkBytes.length) > uploadSession.uploadLength!) {
+      return Response(
+        statusCode: 400,
+        headers: _buildHeaders(),
+        body: Body.text('Chunk size exceeds declared Upload-Length'),
+      );
+    }
+
     final checksumHeader = _getHeader(request, 'upload-checksum');
     if (checksumHeader != null) {
       final verifyErr = verifyChecksum(chunkBytes, checksumHeader);
@@ -530,7 +549,7 @@ class TusUploadRoute extends Route {
     final newOffset = uploadSession.uploadOffset + chunkBytes.length;
     uploadSession.uploadOffset = newOffset;
 
-    // Sliding Window Expiration: extend expiration window on every active chunk receipt
+    // Sliding Window Expiration
     final newExpiresAt = DateTime.now().toUtc().add(expirationDuration);
     uploadSession.expiresAt = newExpiresAt;
 
@@ -573,7 +592,7 @@ class TusUploadRoute extends Route {
 
   /// DELETE: Termination extension
   Future<Response> _handleDelete(Session session, Request request) async {
-    final fileId = _extractFileId(request);
+    final fileId = extractFileId(request);
     if (fileId == null) {
       return Response(
         statusCode: 400,
@@ -616,7 +635,7 @@ class TusUploadRoute extends Route {
 
   /// GET: Download completed uploaded file
   Future<Response> _handleGet(Session session, Request request) async {
-    final fileId = _extractFileId(request);
+    final fileId = extractFileId(request);
     if (fileId == null) {
       return Response(
         statusCode: 400,
@@ -691,7 +710,7 @@ class TusUploadRoute extends Route {
     });
   }
 
-  /// Utility method to purge expired upload sessions and temporary disk files
+  /// Utility method to purge expired upload sessions and orphaned temporary disk files
   Future<int> cleanExpiredUploads(Session session) async {
     final now = DateTime.now().toUtc();
     final expiredSessions = await TusUploadSession.db.find(
@@ -708,10 +727,32 @@ class TusUploadRoute extends Route {
       await TusUploadSession.db.deleteRow(session, s);
       count++;
     }
+
+    // Clean orphaned files in tempDirPath without active database tracking
+    final tempDir = Directory(tempDirPath);
+    if (await tempDir.exists()) {
+      final entities = await tempDir.list().toList();
+      for (final entity in entities) {
+        if (entity is File) {
+          final fileId = entity.uri.pathSegments.isNotEmpty
+              ? entity.uri.pathSegments.last
+              : entity.path.split('/').last;
+          final sessionRow = await TusUploadSession.db.findFirstRow(
+            session,
+            where: (t) => t.fileId.equals(fileId),
+          );
+          if (sessionRow == null || (sessionRow.expiresAt.isBefore(now) && !sessionRow.isComplete)) {
+            await entity.delete();
+            count++;
+          }
+        }
+      }
+    }
+
     return count;
   }
 
-  /// Utility method to parse Base64 encoded Upload-Metadata header string
+  /// Utility method to parse Base64 (Standard & URL-Safe, padded/unpadded) Upload-Metadata header
   static Map<String, String> parseMetadata(String? metadataHeader) {
     if (metadataHeader == null || metadataHeader.trim().isEmpty) {
       return {};
@@ -728,8 +769,13 @@ class TusUploadRoute extends Route {
       if (key.isEmpty) continue;
 
       if (parts.length > 1) {
+        var rawVal = parts[1].trim();
+        rawVal = rawVal.replaceAll('-', '+').replaceAll('_', '/');
+        while (rawVal.length % 4 != 0) {
+          rawVal += '=';
+        }
         try {
-          final decodedValue = utf8.decode(base64.decode(parts[1].trim()));
+          final decodedValue = utf8.decode(base64.decode(rawVal));
           metadata[key] = decodedValue;
         } catch (_) {
           metadata[key] = parts[1].trim();
@@ -826,9 +872,12 @@ class TusUploadRoute extends Route {
     return null;
   }
 
-  String? _extractFileId(Request request) {
+  /// Extracts file ID from URL path, ignoring trailing slashes or collection root paths
+  String? extractFileId(Request request) {
     final segments = request.requestedUri.pathSegments.where((s) => s.isNotEmpty).toList();
-    if (segments.isEmpty) return null;
+    if (segments.length < 2 && (segments.isEmpty || segments.last.toLowerCase() == 'tus')) {
+      return null;
+    }
     return segments.last;
   }
 }

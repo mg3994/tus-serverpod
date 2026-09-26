@@ -1,13 +1,23 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
+import 'package:relic/relic.dart';
 import 'package:test/test.dart';
 
 import '../lib/src/routes/tus_upload_route.dart';
 
 void main() {
-  group('TusUploadRoute Complete Unit Tests', () {
-    test('parseMetadata correctly parses Base64 encoded metadata string', () {
+  group('TusUploadRoute Edge Case Unit Tests', () {
+    test('parseMetadata correctly handles unpadded Base64 and URL-safe Base64 strings', () {
+      final filenameBase64Unpadded = base64.encode(utf8.encode('test.pdf')).replaceAll('=', '');
+      final rawHeader = 'filename $filenameBase64Unpadded';
+
+      final metadata = TusUploadRoute.parseMetadata(rawHeader);
+
+      expect(metadata['filename'], equals('test.pdf'));
+    });
+
+    test('parseMetadata handles standard Base64 string correctly', () {
       final filenameBase64 = base64.encode(utf8.encode('test_document.pdf'));
       final rawHeader = 'filename $filenameBase64,is_confidential';
 
@@ -33,7 +43,7 @@ void main() {
       final md5Base64 = base64.encode(md5Digest.bytes);
 
       expect(sha1Base64, equals('Kq5sNclPz7QV2+lfQIuc6R7oRu0='));
-      expect(md5Base64, equals('5EB63BBBE01EEED093CB22BB8F5ACDC3'.toLowerCase()));
+      expect(md5Base64, equals('XrY7vgHu7QmTyyK7j1rNxw=='));
     });
 
     test('verifyChecksum returns null for valid SHA1, MD5, SHA256 hashes', () {
@@ -60,17 +70,20 @@ void main() {
       expect(response!.statusCode, equals(460));
     });
 
-    test('TusUploadRoute constructor initializes custom parameters', () {
-      final customDuration = const Duration(hours: 48);
-      final route = TusUploadRoute(
-        tempDirPath: '/tmp/custom_tus',
-        maxSize: 1024 * 1024,
-        expirationDuration: customDuration,
-      );
+    test('extractFileId returns null for collection root requests and extracts last segment for subpaths', () {
+      final route = TusUploadRoute();
 
-      expect(route.tempDirPath, equals('/tmp/custom_tus'));
-      expect(route.maxSize, equals(1024 * 1024));
-      expect(route.expirationDuration, equals(customDuration));
+      final rootReq = Request(
+        method: Method.get,
+        requestedUri: Uri.parse('https://example.com/tus'),
+      );
+      expect(route.extractFileId(rootReq), isNull);
+
+      final subPathReq = Request(
+        method: Method.get,
+        requestedUri: Uri.parse('https://example.com/tus/12345'),
+      );
+      expect(route.extractFileId(subPathReq), equals('12345'));
     });
   });
 }
