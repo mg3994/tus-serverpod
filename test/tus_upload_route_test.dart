@@ -37,14 +37,17 @@ void main() {
       expect(md5Base64, equals('5EB63BBBE01EEED093CB22BB8F5ACDC3'.toLowerCase()));
     });
 
-    test('TusUploadRoute constructor initializes custom tempDirPath and maxSize', () {
+    test('TusUploadRoute constructor initializes custom tempDirPath, maxSize, and expirationDuration', () {
+      final customDuration = const Duration(hours: 48);
       final route = TusUploadRoute(
         tempDirPath: '/tmp/custom_tus',
         maxSize: 1024 * 1024,
+        expirationDuration: customDuration,
       );
 
       expect(route.tempDirPath, equals('/tmp/custom_tus'));
       expect(route.maxSize, equals(1024 * 1024));
+      expect(route.expirationDuration, equals(customDuration));
     });
   });
 }

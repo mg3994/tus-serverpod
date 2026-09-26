@@ -7,7 +7,8 @@ This implementation provides a native, production-ready, full-featured implement
 - **Creation (`creation`)**: `POST` request to initialize upload resource
 - **Creation With Upload (`creation-with-upload`)**: Upload chunk inside `POST` creation request
 - **Creation Defer Length (`creation-defer-length`)**: Deferred length via `Upload-Defer-Length: 1`
-- **Expiration (`expiration`)**: `Upload-Expires` tracking in RFC 9110 HTTP-date format, with `410 Gone` on expired sessions
+- **Expiration (`expiration`)**: `Upload-Expires` tracking in RFC 9110 HTTP-date format, with `410 Gone` on expired sessions.
+- **Sliding Window Expiration**: Every valid `PATCH` request automatically extends `expiresAt` (e.g. by 24h), allowing active retries to continue seamlessly without expiring mid-upload.
 - **Checksum (`checksum`)**: Payload integrity validation supporting `sha1`, `md5`, and `sha256` (returning HTTP `460 Checksum Mismatch` on failure)
 - **Termination (`termination`)**: `DELETE` method to cancel upload and free resources
 - **Concatenation (`concatenation`)**: Concatenate partial uploads (`Upload-Concat: partial` & `final;...`)
@@ -81,6 +82,7 @@ void run(List<String> args) async {
 
   final tusRoute = TusUploadRoute(
     maxSize: 5 * 1024 * 1024 * 1024, // 5 GB
+    expirationDuration: const Duration(hours: 24), // Sliding window extension duration
     onUploadCreate: (session, uploadSession, metadata) async {
       session.log('Upload created: ${uploadSession.fileId}');
     },

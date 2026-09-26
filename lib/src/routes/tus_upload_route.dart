@@ -16,6 +16,7 @@ import '../generated/protocol.dart';
 /// Features & Extensions:
 /// - Core Protocol (`HEAD`, `PATCH`, `OPTIONS`, `GET`)
 /// - Extensions: `creation`, `creation-with-upload`, `creation-defer-length`, `expiration`, `checksum`, `termination`, `concatenation`
+/// - Sliding Window Expiration: Every valid `PATCH` request automatically extends `expiresAt` (e.g. by 24h), allowing active retries to continue seamlessly.
 /// - Per-upload Concurrency Locking (prevents parallel PATCH race conditions on the same resource)
 /// - Expiration enforcement (`410 Gone` on expired sessions) & `startExpirationCleanupWorker`
 /// - Configurable upload size limit (`Tus-Max-Size`)
@@ -28,6 +29,7 @@ class TusUploadRoute extends Route {
 
   final String tempDirPath;
   final int? maxSize; // Maximum allowed upload size in bytes
+  final Duration expirationDuration; // Time-to-live extension for active uploads
 
   // Per-file id concurrency locks
   final Map<String, Completer<void>> _locks = {};
@@ -55,6 +57,7 @@ class TusUploadRoute extends Route {
   TusUploadRoute({
     this.tempDirPath = _defaultTempDirPath,
     this.maxSize,
+    this.expirationDuration = const Duration(hours: 24),
     this.onUploadCreate,
     this.onUploadFinish,
     this.onUploadCancel,
@@ -203,7 +206,7 @@ class TusUploadRoute extends Route {
 
     final rawMetadata = _getHeader(request, 'upload-metadata');
     final fileId = const Uuid().v4();
-    final expiresAt = DateTime.now().toUtc().add(const Duration(hours: 24));
+    final expiresAt = DateTime.now().toUtc().add(expirationDuration);
 
     final initialSession = TusUploadSession(
       fileId: fileId,
@@ -417,7 +420,7 @@ class TusUploadRoute extends Route {
     );
   }
 
-  /// PATCH: Receive upload chunk
+  /// PATCH: Receive upload chunk & slide expiration window
   Future<Response> _handlePatch(Session session, Request request) async {
     final fileId = _extractFileId(request);
     if (fileId == null) {
@@ -522,6 +525,10 @@ class TusUploadRoute extends Route {
     final newOffset = uploadSession.uploadOffset + chunkBytes.length;
     uploadSession.uploadOffset = newOffset;
 
+    // Sliding Window Expiration: extend expiration window on every active chunk receipt
+    final newExpiresAt = DateTime.now().toUtc().add(expirationDuration);
+    uploadSession.expiresAt = newExpiresAt;
+
     if (onChunkComplete != null) {
       await onChunkComplete!(session, uploadSession, chunkBytes.length);
     }
@@ -554,7 +561,7 @@ class TusUploadRoute extends Route {
       headers: _buildHeaders(extraHeaders: {
         'Tus-Resumable': _tusVersion,
         'Upload-Offset': newOffset.toString(),
-        'Upload-Expires': _formatHttpDate(uploadSession.expiresAt),
+        'Upload-Expires': _formatHttpDate(newExpiresAt),
       }),
     );
   }
