@@ -1,0 +1,13 @@
+class: TusUploadSession
+table: tus_upload_session
+fields:
+  fileId: String
+  uploadLength: int
+  uploadOffset: int
+  metadata: String?
+  isComplete: bool, default=false
+  expiresAt: DateTime
+indexes:
+  file_id_idx:
+    fields: fileId
+    unique: true
